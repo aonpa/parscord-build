@@ -1,0 +1,118 @@
+name: Build Windows Portable
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-portable
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -Awarnings
+  TARGET: x86_64-pc-windows-msvc
+
+jobs:
+  windows-portable:
+    name: Windows x64 portable
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: src
+
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: aonpa/Parscord-v2
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12.4.1
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: src/pnpm-lock.yaml
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1.12
+        with:
+          toolchain: 1.96
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src/src-tauri -> target
+            src/updater -> target
+          key: ${{ env.TARGET }}
+
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Download shelter.js fallback
+        run: pnpm shupdate
+
+      - name: Build updater
+        run: |
+          cargo build --release --manifest-path updater/Cargo.toml
+          Copy-Item 'updater/target/release/updater.exe' 'src-tauri/updater.exe' -Force
+
+      - name: Build ParsCord
+        run: pnpm tauri build --no-bundle --target $env:TARGET
+
+      - name: Assemble portable bundle
+        run: |
+          $release = "src-tauri/target/$env:TARGET/release"
+          $stage = "portable/ParsCord"
+
+          if (-not (Test-Path "$release/ParsCord.exe")) { throw "ParsCord.exe was not produced" }
+          if (Test-Path "portable") { Remove-Item "portable" -Recurse -Force }
+          New-Item -ItemType Directory -Force $stage | Out-Null
+
+          Copy-Item "$release/ParsCord.exe" $stage
+          Copy-Item 'src-tauri/updater.exe' $stage
+          Copy-Item 'src-tauri/icons' "$stage/icons" -Recurse
+          Copy-Item 'src-tauri/injection' "$stage/injection" -Recurse
+          Copy-Item 'src-tauri/extension' "$stage/extension" -Recurse
+          New-Item -ItemType Directory -Force "$stage/plugins", "$stage/themes" | Out-Null
+          New-Item -ItemType File -Force "$stage/.portable" | Out-Null
+          Get-ChildItem $stage -Force | Select-Object Name, Length
+
+      - name: Create portable zip
+        run: |
+          $stage = "portable/ParsCord"
+          $zip = "ParsCord.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [System.IO.Compression.ZipFile]::CreateFromDirectory(
+            (Resolve-Path $stage).Path,
+            (Join-Path (Get-Location) $zip),
+            [System.IO.Compression.CompressionLevel]::Optimal,
+            $false
+          )
+          $archive = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $zip).Path)
+          try { $entries = @($archive.Entries | ForEach-Object { $_.FullName -replace '\\', '/' }) } finally { $archive.Dispose() }
+          foreach ($required in @('ParsCord.exe','updater.exe','.portable','extension/manifest.json','injection/shelter.js')) {
+            if ($entries -notcontains $required) { throw "Missing '$required' in $zip" }
+          }
+          Write-Host "ParsCord.zip contains $($entries.Count) entries"
+
+      - name: Upload portable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: parscord-windows-x64-portable
+          path: src/ParsCord.zip
+          if-no-files-found: error
+          retention-days: 14
